@@ -9,6 +9,8 @@ import {
   type GetProgramAccountsConfig,
 } from "@solana/web3.js";
 import * as borsh from "borsh";
+import * as fs from "fs";
+import * as path from "path";
 
 interface ApplicationAccount {
   bump: number;
@@ -49,6 +51,14 @@ const accountKeys = accounts.map((account) => account.pubkey);
 
 console.log("Found", accountKeys.length, "accounts");
 
+const allAccountData: Array<{
+  accountAddress: string;
+  bump: number;
+  pre_req_ts: boolean;
+  pre_req_rs: boolean;
+  github: string;
+}> = [];
+
 // Process each account
 for (const key of accountKeys) {
   try {
@@ -63,6 +73,14 @@ for (const key of accountKeys) {
         dataWithoutDiscriminator
       ) as ApplicationAccount;
 
+      allAccountData.push({
+        accountAddress: key.toString(),
+        bump: deserializedData.bump,
+        pre_req_ts: deserializedData.pre_req_ts,
+        pre_req_rs: deserializedData.pre_req_rs,
+        github: deserializedData.github,
+      });
+
       console.log("\nAccount:", key.toString());
       console.log("Deserialized data:", {
         bump: deserializedData.bump,
@@ -75,3 +93,16 @@ for (const key of accountKeys) {
     console.error("Error deserializing account", key.toString(), ":", error);
   }
 }
+
+const outputDir = "./output";
+if (!fs.existsSync(outputDir)) {
+  fs.mkdirSync(outputDir, { recursive: true });
+}
+
+const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+const jsonFilename = `accounts_${timestamp}.json`;
+const jsonPath = path.join(outputDir, jsonFilename);
+
+fs.writeFileSync(jsonPath, JSON.stringify(allAccountData, null, 2));
+console.log(`\n Data saved to: ${jsonPath}`);
+console.log(` Total accounts processed: ${allAccountData.length}`);
