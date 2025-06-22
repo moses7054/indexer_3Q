@@ -6,7 +6,7 @@ import {
   Connection,
   PublicKey,
   clusterApiUrl,
-  type GetProgramAccountsConfig,
+  type GetMultipleAccountsConfig,
 } from "@solana/web3.js";
 import * as borsh from "borsh";
 import * as fs from "fs";
@@ -31,11 +31,6 @@ const ApplicationAccountSchema = {
 // ApplicationAccount discriminator from IDL.json
 const APPLICATION_ACCOUNT_DISCRIMINATOR = [222, 181, 17, 200, 212, 149, 64, 88];
 
-// Size constraints for student accounts
-// 8 bytes (discriminator) + 1 byte (bump) + 1 byte (bool) + 1 byte (bool) + 4 bytes (string length) + N bytes (github)
-const MIN_STUDENT_ACCOUNT_SIZE = 8 + 1 + 1 + 1 + 4 + 1; // Minimum 1 char for GitHub
-const MAX_STUDENT_ACCOUNT_SIZE = 8 + 1 + 1 + 1 + 4 + 50; // Maximum 50 chars for GitHub
-
 // Parse command line arguments
 const args = process.argv.slice(2);
 const filterType = args[0] || "all";
@@ -56,23 +51,18 @@ if (!programIdString) {
 
 let programId = new PublicKey(programIdString);
 
-// Replace the config section with:
-let config: GetProgramAccountsConfig = {
+// First, get all account addresses using getProgramAccounts with minimal data
+let config = {
   dataSlice: {
     offset: 0,
     length: 0,
   },
-  // No filters - we'll filter client-side
 };
-
-console.log(
-  `🔍 Fetching accounts with size between ${MIN_STUDENT_ACCOUNT_SIZE} and ${MAX_STUDENT_ACCOUNT_SIZE} bytes...`
-);
 
 let accounts = await connection.getProgramAccounts(programId, config);
 const accountKeys = accounts.map((account) => account.pubkey);
 
-console.log(`Found ${accountKeys.length} accounts (pre-filtered by size)`);
+console.log(`Found ${accountKeys.length} accounts`);
 
 // Helper function to check if account is an ApplicationAccount
 function isApplicationAccount(data: Buffer): boolean {
@@ -84,106 +74,151 @@ function isApplicationAccount(data: Buffer): boolean {
   );
 }
 
-const allAccountData: Array<{
-  accountAddress: string;
-  bump: number;
-  pre_req_ts: boolean;
-  pre_req_rs: boolean;
-  github: string;
-}> = [];
+// Helper function to process accounts in batches
+async function processAccountsInBatches(
+  accountKeys: PublicKey[],
+  batchSize: number = 90
+) {
+  const allAccountData: Array<{
+    accountAddress: string;
+    bump: number;
+    pre_req_ts: boolean;
+    pre_req_rs: boolean;
+    github: string;
+  }> = [];
 
-const filteredAccountData: Array<{
-  accountAddress: string;
-  bump: number;
-  pre_req_ts: boolean;
-  pre_req_rs: boolean;
-  github: string;
-}> = [];
+  const filteredAccountData: Array<{
+    accountAddress: string;
+    bump: number;
+    pre_req_ts: boolean;
+    pre_req_rs: boolean;
+    github: string;
+  }> = [];
 
-let studentAccountsFound = 0;
-let nonStudentAccountsSkipped = 0;
+  let studentAccountsFound = 0;
+  let nonStudentAccountsSkipped = 0;
 
-// Process each account
-for (const key of accountKeys) {
-  try {
-    const info = await connection.getAccountInfo(key);
-    if (info && info.data) {
-      // Step 1: Check if it's actually a student account
-      if (!isApplicationAccount(info.data)) {
-        console.log(
-          `⏭️  Skipping non-student account: ${key.toString()} (wrong discriminator)`
-        );
-        nonStudentAccountsSkipped++;
-        continue;
-      }
+  // Process accounts in batches
+  for (let i = 0; i < accountKeys.length; i += batchSize) {
+    const batch = accountKeys.slice(i, i + batchSize);
+    console.log(
+      `\n🔄 Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(
+        accountKeys.length / batchSize
+      )} (${batch.length} accounts)`
+    );
 
-      // Step 2: Safe to deserialize since we confirmed it's a student account
-      const dataWithoutDiscriminator = info.data.slice(8);
-
-      const deserializedData = borsh.deserialize(
-        ApplicationAccountSchema,
-        dataWithoutDiscriminator
-      ) as ApplicationAccount;
-
-      const accountData = {
-        accountAddress: key.toString(),
-        bump: deserializedData.bump,
-        pre_req_ts: deserializedData.pre_req_ts,
-        pre_req_rs: deserializedData.pre_req_rs,
-        github: deserializedData.github,
+    try {
+      const batchConfig: GetMultipleAccountsConfig = {
+        commitment: "confirmed",
       };
 
-      allAccountData.push(accountData);
-      studentAccountsFound++;
+      const batchAccounts = await connection.getMultipleAccountsInfo(
+        batch,
+        batchConfig
+      );
 
-      // Apply filter based on command line argument
-      let shouldInclude = false;
-      switch (filterType) {
-        case "all":
-          shouldInclude = true;
-          break;
-        case "initialized":
-          shouldInclude =
-            !deserializedData.pre_req_ts && !deserializedData.pre_req_rs;
-          break;
-        case "ts_only":
-          shouldInclude =
-            deserializedData.pre_req_ts && !deserializedData.pre_req_rs;
-          break;
-        case "rust_only":
-          shouldInclude =
-            !deserializedData.pre_req_ts && deserializedData.pre_req_rs;
-          break;
-        case "completed":
-          shouldInclude =
-            deserializedData.pre_req_ts && deserializedData.pre_req_rs;
-          break;
-        default:
-          console.error(
-            "❌ Invalid filter type. Use: all, initialized, ts_only, rust_only, completed"
+      // Process each account in the batch
+      for (let j = 0; j < batch.length; j++) {
+        const key = batch[j];
+        const info = batchAccounts[j];
+
+        if (!info || !info.data) {
+          console.log(`⏭️  Skipping account with no data: ${key.toString()}`);
+          continue;
+        }
+
+        // Step 1: Check if it's actually a student account
+        if (!isApplicationAccount(info.data)) {
+          console.log(
+            `⏭️  Skipping non-student account: ${key.toString()} (wrong discriminator)`
           );
-          process.exit(1);
-      }
+          nonStudentAccountsSkipped++;
+          continue;
+        }
 
-      if (shouldInclude) {
-        filteredAccountData.push(accountData);
-      }
+        // Step 2: Safe to deserialize since we confirmed it's a student account
+        const dataWithoutDiscriminator = info.data.slice(8);
 
-      console.log(`\n✅ Student Account: ${key.toString()}`);
-      console.log("Status:", {
-        initialized:
-          !deserializedData.pre_req_ts && !deserializedData.pre_req_rs
-            ? "✅"
-            : "❌",
-        ts_completed: deserializedData.pre_req_ts ? "✅" : "❌",
-        rust_completed: deserializedData.pre_req_rs ? "✅" : "❌",
-        github: deserializedData.github,
-      });
+        const deserializedData = borsh.deserialize(
+          ApplicationAccountSchema,
+          dataWithoutDiscriminator
+        ) as ApplicationAccount;
+
+        const accountData = {
+          accountAddress: key.toString(),
+          bump: deserializedData.bump,
+          pre_req_ts: deserializedData.pre_req_ts,
+          pre_req_rs: deserializedData.pre_req_rs,
+          github: deserializedData.github,
+        };
+
+        allAccountData.push(accountData);
+        studentAccountsFound++;
+
+        // Apply filter based on command line argument
+        let shouldInclude = false;
+        switch (filterType) {
+          case "all":
+            shouldInclude = true;
+            break;
+          case "initialized":
+            shouldInclude =
+              !deserializedData.pre_req_ts && !deserializedData.pre_req_rs;
+            break;
+          case "ts_only":
+            shouldInclude =
+              deserializedData.pre_req_ts && !deserializedData.pre_req_rs;
+            break;
+          case "rust_only":
+            shouldInclude =
+              !deserializedData.pre_req_ts && deserializedData.pre_req_rs;
+            break;
+          case "completed":
+            shouldInclude =
+              deserializedData.pre_req_ts && deserializedData.pre_req_rs;
+            break;
+          default:
+            console.error(
+              "❌ Invalid filter type. Use: all, initialized, ts_only, rust_only, completed"
+            );
+            process.exit(1);
+        }
+
+        if (shouldInclude) {
+          filteredAccountData.push(accountData);
+        }
+
+        console.log(`✅ Student Account: ${key.toString()}`);
+        console.log("Status:", {
+          initialized:
+            !deserializedData.pre_req_ts && !deserializedData.pre_req_rs
+              ? "✅"
+              : "❌",
+          ts_completed: deserializedData.pre_req_ts ? "✅" : "❌",
+          rust_completed: deserializedData.pre_req_rs ? "✅" : "❌",
+          github: deserializedData.github,
+        });
+      }
+    } catch (error) {
+      console.error(`❌ Error processing batch starting at index ${i}:`, error);
     }
-  } catch (error) {
-    console.error(`❌ Error processing account ${key.toString()}:`, error);
   }
+
+  return {
+    allAccountData,
+    filteredAccountData,
+    studentAccountsFound,
+    nonStudentAccountsSkipped,
+  };
 }
+
+// Process all accounts in batches
+const {
+  allAccountData,
+  filteredAccountData,
+  studentAccountsFound,
+  nonStudentAccountsSkipped,
+} = await processAccountsInBatches(accountKeys, 90);
 
 const outputDir = "./output";
 if (!fs.existsSync(outputDir)) {
